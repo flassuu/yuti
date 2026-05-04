@@ -1,0 +1,829 @@
+#!/usr/bin/env bash
+# yuti - YouTube Music playlist sync manager
+# A yt-dlp wrapper for managing offline music playlists
+#
+# Usage: yuti <command> [arguments] [flags]
+# Run 'yuti --help' for full documentation.
+
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Version & Metadata
+# ─────────────────────────────────────────────────────────────────────────────
+
+readonly VERSION="0.0.1"
+readonly SCRIPT_NAME="yuti"
+readonly GITHUB_URL="https://github.com/flassuu/yuti"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration paths (XDG Base Directory compliant)
+# ─────────────────────────────────────────────────────────────────────────────
+
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/yuti"
+readonly PLAYLISTS_DIR="$CONFIG_DIR/playlists" # Stores per-playlist JSON configs
+readonly ARCHIVES_DIR="$CONFIG_DIR/archives"   # Stores yt-dlp download archives
+readonly HISTORY_FILE="$CONFIG_DIR/sync_history.log"
+
+readonly DEFAULT_MUSIC_DIR="$HOME/Music"
+readonly DEFAULT_HISTORY_COUNT=10
+readonly DEFAULT_QUALITY="192"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANSI color codes
+# ─────────────────────────────────────────────────────────────────────────────
+
+readonly RED="\e[31m"
+readonly GREEN="\e[32m"
+readonly YELLOW="\e[33m"
+readonly BLUE="\e[34m"
+readonly MAGENTA="\e[35m"
+readonly CYAN="\e[36m"
+readonly BOLD="\e[1m"
+readonly DIM="\e[2m"
+readonly RESET="\e[0m"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+info() { echo -e "${BLUE}::${RESET} $*"; }
+success() { echo -e "${GREEN}::${RESET} $*"; }
+warn() { echo -e "${YELLOW}:: warning:${RESET} $*" >&2; }
+die() {
+  echo -e "${RED}:: error:${RESET} $*" >&2
+  exit 1
+}
+
+separator() {
+  echo -e "${DIM}$(printf '─%.0s' {1..64})${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Verify that all required external commands are available.
+require() {
+  for cmd in "$@"; do
+    command -v "$cmd" &>/dev/null ||
+      die "Required dependency not found: '${cmd}'. Please install it and try again."
+  done
+}
+
+# Create all necessary config directories and ensure the history file exists.
+init_dirs() {
+  mkdir -p "$PLAYLISTS_DIR" "$ARCHIVES_DIR"
+  [[ -f "$HISTORY_FILE" ]] || touch "$HISTORY_FILE"
+}
+
+# Return the full path to a playlist's JSON config file.
+playlist_file() { echo "$PLAYLISTS_DIR/${1}.json"; }
+
+# Return the full path to a playlist's yt-dlp download archive.
+archive_file() { echo "$ARCHIVES_DIR/${1}.txt"; }
+
+# Check if a playlist config exists.
+playlist_exists() { [[ -f "$(playlist_file "$1")" ]]; }
+
+# Read a single field from a playlist's JSON config using jq.
+playlist_get() {
+  jq -r ".${2}" "$(playlist_file "$1")"
+}
+
+# Return the current date/time as an ISO 8601 timestamp.
+now() { date +"%Y-%m-%dT%H:%M:%S"; }
+
+# Expand a leading tilde to the full home directory path.
+expand_path() { echo "${1/#\~/$HOME}"; }
+
+# Collapse the home directory back to ~ for display purposes.
+display_path() { echo "${1/$HOME/\~}"; }
+
+# Safely count lines matching a pattern in a file.
+# Returns 0 if the file is empty or no match found (never exits non-zero).
+count_matches() {
+  local pattern="$1" file="$2"
+  grep -c "$pattern" "$file" 2>/dev/null || echo "0"
+}
+
+# Validate that a quality value is one of the accepted bitrates.
+validate_quality() {
+  case "$1" in
+  128 | 192 | 256 | 320) return 0 ;;
+  *) die "Invalid quality '${1}'. Accepted values: 128, 192, 256, 320" ;;
+  esac
+}
+
+# Print a single-line track status row used in normal (non-nerd) sync output.
+# Overwrites the current terminal line, then prints a final newline.
+print_track_status() {
+  local status="$1" # downloading | done | skipped | error
+  local title="$2"
+
+  # Truncate long titles so the line always fits on one terminal line
+  local max_len=50
+  if [[ ${#title} -gt $max_len ]]; then
+    title="${title:0:$max_len}..."
+  fi
+
+  case "$status" in
+  downloading)
+    printf "\r  ${CYAN}%-12s${RESET}  %s%-*s" "[Downloading]" "$title" "$((max_len - ${#title}))" " "
+    ;;
+  done)
+    printf "\r  ${GREEN}%-12s${RESET}  %s%-*s\n" "[Done]" "$title" "$((max_len - ${#title}))" " "
+    ;;
+  skipped)
+    printf "\r  ${DIM}%-12s${RESET}  %s%-*s\n" "[Skipped]" "$title" "$((max_len - ${#title}))" " "
+    ;;
+  error)
+    printf "\r  ${RED}%-12s${RESET}  %s%-*s\n" "[Error]" "$title" "$((max_len - ${#title}))" " "
+    ;;
+  esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Help
+# ─────────────────────────────────────────────────────────────────────────────
+
+show_help() {
+  echo -e "${BOLD}${BLUE}${SCRIPT_NAME}${RESET} ${DIM}v${VERSION}${RESET}  —  YouTube Music playlist sync manager"
+  echo
+  echo -e "${BOLD}Usage:${RESET}"
+  echo -e "  ${SCRIPT_NAME} ${GREEN}<command>${RESET} [arguments] [flags]"
+  echo
+  echo -e "${BOLD}Commands:${RESET}"
+  echo -e "  ${GREEN}add${RESET} ${CYAN}<name> <url> [path]${RESET} [flags]"
+  echo -e "       Register a playlist. Flags are saved to the sync config."
+  echo -e "       ${DIM}Default path: ~/Music/<name>/${RESET}"
+  echo
+  echo -e "  ${GREEN}update${RESET} ${CYAN}<name> [url] [path]${RESET} [flags]"
+  echo -e "       Update a playlist's URL, path, or saved flags."
+  echo -e "       ${DIM}Omit an argument to keep its current value.${RESET}"
+  echo
+  echo -e "  ${GREEN}remove${RESET} ${CYAN}<name>${RESET}"
+  echo -e "       Remove a playlist config and its download archive."
+  echo -e "       ${DIM}Does not delete any downloaded music files.${RESET}"
+  echo
+  echo -e "  ${GREEN}sync${RESET} ${CYAN}<name>${RESET} [flags]"
+  echo -e "       Download new tracks, skip already-present ones."
+  echo -e "       Flags passed here override the saved config for that run only."
+  echo
+  echo -e "  ${GREEN}download${RESET} ${CYAN}<url or name> [path]${RESET} [flags]"
+  echo -e "       One-shot download. Does not create a sync config."
+  echo -e "       ${DIM}Saves to current directory if path is omitted.${RESET}"
+  echo
+  echo -e "  ${GREEN}sync-list${RESET}"
+  echo -e "       Show all registered playlists with paths and last sync time."
+  echo
+  echo -e "  ${GREEN}sync-history${RESET} ${CYAN}[N]${RESET}"
+  echo -e "       Show the last ${CYAN}N${RESET} sync log entries ${DIM}(default: ${DEFAULT_HISTORY_COUNT})${RESET}."
+  echo
+  echo -e "${BOLD}Flags:${RESET}"
+  echo -e "  ${CYAN}-q, --quality <kbps>${RESET}   Audio bitrate: 128 / 192 / 256 / 320 ${DIM}(default: ${DEFAULT_QUALITY})${RESET}"
+  echo -e "  ${CYAN}--m3u${RESET}                  Generate an .m3u playlist file after sync"
+  echo -e "  ${CYAN}--lyrics${RESET}               Download lyrics (LRC) alongside tracks"
+  echo -e "  ${CYAN}--mpcu${RESET}                 Run 'mpc update' after sync (if mpc is installed)"
+  echo -e "  ${CYAN}--nerd${RESET}                 Show full raw yt-dlp output instead of compact view"
+  echo
+  echo -e "${BOLD}Options:${RESET}"
+  echo -e "  ${CYAN}-h, --help${RESET}             Show this help message and exit"
+  echo -e "  ${CYAN}-v, --version${RESET}          Show version number and exit"
+  echo
+  echo -e "${BOLD}Documentation & examples:${RESET}"
+  echo -e "  ${DIM}${GITHUB_URL}${RESET}"
+  echo
+  echo -e "${BOLD}Config directory:${RESET} ${DIM}${CONFIG_DIR}${RESET}"
+  echo -e "${BOLD}Dependencies:${RESET}     ${DIM}yt-dlp, jq, ffmpeg${RESET}  ${DIM}(optional: atomicparsley, mpc)${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Flag parsing
+# Parses flags from an argument list into named variables.
+# Call: parse_flags "$@"
+# Sets: FLAG_QUALITY, FLAG_M3U, FLAG_LYRICS, FLAG_MPCU, FLAG_NERD
+# Returns remaining positional args in POSITIONAL array.
+# ─────────────────────────────────────────────────────────────────────────────
+
+parse_flags() {
+  FLAG_QUALITY="$DEFAULT_QUALITY"
+  FLAG_M3U=false
+  FLAG_LYRICS=false
+  FLAG_MPCU=false
+  FLAG_NERD=false
+  POSITIONAL=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    -q | --quality)
+      [[ -n "${2:-}" ]] || die "--quality requires a value (128/192/256/320)"
+      validate_quality "$2"
+      FLAG_QUALITY="$2"
+      shift 2
+      ;;
+    --m3u)
+      FLAG_M3U=true
+      shift
+      ;;
+    --lyrics)
+      FLAG_LYRICS=true
+      shift
+      ;;
+    --mpcu)
+      FLAG_MPCU=true
+      shift
+      ;;
+    --nerd)
+      FLAG_NERD=true
+      shift
+      ;;
+    -*)
+      die "Unknown flag: '${1}'. Run '${SCRIPT_NAME} --help' for usage."
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+    esac
+  done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M3U generation
+# Scans a directory for audio files and writes an .m3u playlist file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+generate_m3u() {
+  local name="$1" path="$2"
+  local m3u_file="${path}/${name}.m3u"
+
+  {
+    echo "#EXTM3U"
+    find "$path" -maxdepth 1 \
+      \( -name "*.mp3" -o -name "*.opus" -o -name "*.m4a" -o -name "*.flac" \) \
+      -printf "#EXTINF:-1,%f\n%f\n"
+  } >"$m3u_file"
+
+  info "M3U playlist written: ${DIM}$(display_path "$m3u_file")${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# yt-dlp runner
+# Builds and executes the yt-dlp command with the requested options.
+# In normal mode: streams output through a compact per-track status display.
+# In nerd mode:   passes output directly to the terminal unmodified.
+#
+# Sets globals after completion:
+#   SYNC_DOWNLOADED, SYNC_SKIPPED, SYNC_ERRORS
+# ─────────────────────────────────────────────────────────────────────────────
+
+run_ytdlp() {
+  local url="$1"
+  local out_path="$2"
+  local archive="$3" # path to yt-dlp archive file, or "" to disable
+  local quality="$4"
+  local m3u="$5" # true|false — handled by caller after this fn returns
+  local lyrics="$6"
+  local nerd="$7"
+
+  # Build the yt-dlp argument array
+  local ytdlp_args=(
+    --extract-audio
+    --audio-format mp3
+    --audio-quality "${quality}K"
+    --embed-thumbnail
+    --add-metadata
+    --ignore-errors
+    --newline
+    --output "${out_path}/%(title)s.%(ext)s"
+  )
+
+  # AtomicParsley is only needed for thumbnail embedding in MP3;
+  # yt-dlp will skip it gracefully if not present, so no hard check.
+
+  [[ -n "$archive" ]] && ytdlp_args+=(--download-archive "$archive")
+
+  if [[ "$lyrics" == "true" ]]; then
+    ytdlp_args+=(
+      --write-subs
+      --write-auto-subs
+      --sub-langs "en.*"
+      --convert-subs lrc
+    )
+  fi
+
+  ytdlp_args+=("$url")
+
+  # Temp file collects the full yt-dlp output for stats parsing.
+  local tmpout
+  tmpout="$(mktemp --suffix=.yuti)"
+
+  local exit_code=0
+
+  if [[ "$nerd" == "true" ]]; then
+    # Nerd mode: raw unfiltered output
+    set +e
+    yt-dlp "${ytdlp_args[@]}" 2>&1 | tee "$tmpout"
+    exit_code="${PIPESTATUS[0]}"
+    set -e
+  else
+    # Compact mode: parse yt-dlp output line-by-line and display
+    # a single updating status line per track.
+    local current_title=""
+
+    set +e
+    while IFS= read -r line; do
+      # Write every line to the stats temp file regardless
+      echo "$line" >>"$tmpout"
+
+      # Detect which track yt-dlp is currently processing.
+      # "Downloading webpage" appears at the start of each track.
+      if [[ "$line" =~ \[youtube\]\ ([^:]+):\ Downloading ]]; then
+        : # video id line — title comes later
+
+      # "[download] Destination: ..." — yt-dlp is starting a new file
+      elif [[ "$line" =~ ^\[download\]\ Destination:\ .*/(.+)$ ]]; then
+        current_title="${BASH_REMATCH[1]}"
+        # Strip extension for display
+        current_title="${current_title%.*}"
+        print_track_status "downloading" "$current_title"
+
+      # "[ffmpeg] Destination: ..." — conversion done, track complete
+      elif [[ "$line" =~ ^\[(ffmpeg|ExtractAudio)\]\ Destination:\ .*/(.+)$ ]]; then
+        [[ -n "$current_title" ]] && print_track_status "done" "$current_title"
+        current_title=""
+
+      # Already in archive — skipped
+      elif [[ "$line" == *"has already been recorded in the archive"* ]]; then
+        # Extract video title from the line if possible
+        local skip_title
+        skip_title="$(echo "$line" | grep -oP '(?<=\] ).*(?= has already)' || echo "track")"
+        print_track_status "skipped" "$skip_title"
+
+      # Error line
+      elif [[ "$line" =~ ^ERROR: ]]; then
+        local err_title="${current_title:-unknown track}"
+        print_track_status "error" "$err_title"
+        current_title=""
+      fi
+
+    done < <(yt-dlp "${ytdlp_args[@]}" 2>&1)
+    exit_code=$?
+    set -e
+  fi
+
+  # Parse statistics from the collected output.
+  # grep -c exits with code 1 when no matches are found, which would
+  # trigger set -e. We use "|| true" to suppress that safely.
+  local dl sk er
+  dl="$(grep -c '^\[download\] Destination:' "$tmpout" 2>/dev/null || true)"
+  sk="$(grep -c 'has already been recorded in the archive' "$tmpout" 2>/dev/null || true)"
+  er="$(grep -c '^ERROR:' "$tmpout" 2>/dev/null || true)"
+
+  # Trim any trailing whitespace/newlines from the counts
+  SYNC_DOWNLOADED="${dl//[[:space:]]/}"
+  SYNC_SKIPPED="${sk//[[:space:]]/}"
+  SYNC_ERRORS="${er//[[:space:]]/}"
+
+  # Default to 0 if empty
+  : "${SYNC_DOWNLOADED:=0}"
+  : "${SYNC_SKIPPED:=0}"
+  : "${SYNC_ERRORS:=0}"
+
+  rm -f "$tmpout"
+
+  return "$exit_code"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Print sync summary block
+# ─────────────────────────────────────────────────────────────────────────────
+
+print_summary() {
+  local name="$1"
+
+  echo
+  separator
+  echo
+  echo -e "${BOLD}Summary:${RESET} ${name}"
+  echo -e "  ${GREEN}Downloaded:${RESET}  ${BOLD}${SYNC_DOWNLOADED}${RESET} new track(s)"
+  echo -e "  ${DIM}Skipped:${RESET}     ${SYNC_SKIPPED} already present"
+  if [[ "${SYNC_ERRORS}" -gt 0 ]]; then
+    echo -e "  ${RED}Errors:${RESET}      ${SYNC_ERRORS}"
+  else
+    echo -e "  ${DIM}Errors:${RESET}      0${RESET}"
+  fi
+  echo
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command: add
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_add() {
+  parse_flags "$@"
+  set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+  local name="${1:-}" url="${2:-}" path="${3:-}"
+
+  [[ -z "$name" ]] && die "Playlist name is required.\n  Usage: ${SCRIPT_NAME} add <name> <url> [path] [flags]"
+  [[ -z "$url" ]] && die "Playlist URL is required.\n  Usage: ${SCRIPT_NAME} add <name> <url> [path] [flags]"
+  [[ "$url" =~ ^https?:// ]] || die "Invalid URL: '${url}'. Must start with http:// or https://"
+
+  playlist_exists "$name" &&
+    die "Playlist '${name}' already exists. Use '${SCRIPT_NAME} update' to modify it."
+
+  if [[ -z "$path" ]]; then
+    path="${DEFAULT_MUSIC_DIR}/${name}"
+  else
+    path="$(expand_path "$path")"
+  fi
+
+  mkdir -p "$path"
+
+  # Serialize all flags into the JSON config so 'sync' reuses them automatically
+  jq -n \
+    --arg name "$name" \
+    --arg url "$url" \
+    --arg path "$path" \
+    --arg created "$(now)" \
+    --arg updated "$(now)" \
+    --arg quality "$FLAG_QUALITY" \
+    --argjson m3u "$FLAG_M3U" \
+    --argjson lyrics "$FLAG_LYRICS" \
+    --argjson mpcu "$FLAG_MPCU" \
+    '{
+            name:       $name,
+            url:        $url,
+            path:       $path,
+            created_at: $created,
+            updated_at: $updated,
+            flags: {
+                quality: $quality,
+                m3u:     $m3u,
+                lyrics:  $lyrics,
+                mpcu:    $mpcu
+            }
+        }' >"$(playlist_file "$name")"
+
+  success "Playlist ${BOLD}${name}${RESET} registered."
+  echo -e "  ${DIM}URL:${RESET}     $url"
+  echo -e "  ${DIM}Path:${RESET}    $(display_path "$path")"
+  echo -e "  ${DIM}Quality:${RESET} ${FLAG_QUALITY} kbps"
+  echo -e "  ${DIM}M3U:${RESET}     ${FLAG_M3U}"
+  echo -e "  ${DIM}Lyrics:${RESET}  ${FLAG_LYRICS}"
+  echo -e "  ${DIM}MPC upd:${RESET} ${FLAG_MPCU}"
+  echo
+  info "Run: ${GREEN}${SCRIPT_NAME} sync ${name}${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command: update
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_update() {
+  parse_flags "$@"
+  set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+  local name="${1:-}" url="${2:-}" path="${3:-}"
+
+  [[ -z "$name" ]] && die "Playlist name is required.\n  Usage: ${SCRIPT_NAME} update <name> [url] [path] [flags]"
+  playlist_exists "$name" ||
+    die "Playlist '${name}' not found. Use '${SCRIPT_NAME} add' to create it."
+
+  # Read current values; fall back to them for any omitted arguments
+  local cur_url cur_path cur_quality cur_m3u cur_lyrics cur_mpcu
+  cur_url="$(playlist_get "$name" url)"
+  cur_path="$(playlist_get "$name" path)"
+  cur_quality="$(playlist_get "$name" 'flags.quality')"
+  cur_m3u="$(playlist_get "$name" 'flags.m3u')"
+  cur_lyrics="$(playlist_get "$name" 'flags.lyrics')"
+  cur_mpcu="$(playlist_get "$name" 'flags.mpcu')"
+
+  [[ -z "$url" ]] && url="$cur_url"
+  [[ "$url" =~ ^https?:// ]] || die "Invalid URL: '${url}'."
+
+  if [[ -n "$path" ]]; then
+    path="$(expand_path "$path")"
+    mkdir -p "$path"
+  else
+    path="$cur_path"
+  fi
+
+  # If a flag was explicitly supplied, use the parsed value; otherwise keep current
+  # We detect "explicitly supplied" by checking if parse_flags changed the default
+  local new_quality new_m3u new_lyrics new_mpcu
+  new_quality="$([[ "$FLAG_QUALITY" != "$DEFAULT_QUALITY" ]] && echo "$FLAG_QUALITY" || echo "$cur_quality")"
+  new_m3u="$([[ "$FLAG_M3U" == "true" ]] && echo "true" || echo "$cur_m3u")"
+  new_lyrics="$([[ "$FLAG_LYRICS" == "true" ]] && echo "true" || echo "$cur_lyrics")"
+  new_mpcu="$([[ "$FLAG_MPCU" == "true" ]] && echo "true" || echo "$cur_mpcu")"
+
+  local tmp
+  tmp="$(mktemp)"
+  jq \
+    --arg url "$url" \
+    --arg path "$path" \
+    --arg updated "$(now)" \
+    --arg quality "$new_quality" \
+    --argjson m3u "$new_m3u" \
+    --argjson lyrics "$new_lyrics" \
+    --argjson mpcu "$new_mpcu" \
+    '.url        = $url    |
+         .path       = $path   |
+         .updated_at = $updated |
+         .flags.quality = $quality |
+         .flags.m3u     = $m3u     |
+         .flags.lyrics  = $lyrics  |
+         .flags.mpcu    = $mpcu' \
+    "$(playlist_file "$name")" >"$tmp"
+  mv "$tmp" "$(playlist_file "$name")"
+
+  success "Playlist ${BOLD}${name}${RESET} updated."
+  echo -e "  ${DIM}URL:${RESET}     $url"
+  echo -e "  ${DIM}Path:${RESET}    $(display_path "$path")"
+  echo -e "  ${DIM}Quality:${RESET} ${new_quality} kbps"
+  echo -e "  ${DIM}M3U:${RESET}     ${new_m3u}"
+  echo -e "  ${DIM}Lyrics:${RESET}  ${new_lyrics}"
+  echo -e "  ${DIM}MPC upd:${RESET} ${new_mpcu}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command: remove
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_remove() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Playlist name is required.\n  Usage: ${SCRIPT_NAME} remove <name>"
+  playlist_exists "$name" || die "Playlist '${name}' not found."
+
+  warn "This will delete the config and archive for '${BOLD}${name}${RESET}'."
+  echo -e "  ${DIM}No music files will be deleted from disk.${RESET}"
+  read -rp "  Confirm removal? [y/N] " confirm
+  [[ "${confirm,,}" == "y" ]] || {
+    info "Aborted."
+    return 0
+  }
+
+  rm -f "$(playlist_file "$name")"
+  rm -f "$(archive_file "$name")"
+
+  success "Playlist '${BOLD}${name}${RESET}' removed."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command: sync
+# Reads saved flags from the playlist config and merges any runtime overrides.
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_sync() {
+  parse_flags "$@"
+  set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Playlist name is required.\n  Usage: ${SCRIPT_NAME} sync <name> [flags]"
+  playlist_exists "$name" ||
+    die "Playlist '${name}' not found. Use '${SCRIPT_NAME} add' to register it."
+
+  local url path archive
+  url="$(playlist_get "$name" url)"
+  path="$(playlist_get "$name" path)"
+  archive="$(archive_file "$name")"
+
+  # Load saved flags from config, then let any runtime flags override them
+  local saved_quality saved_m3u saved_lyrics saved_mpcu
+  saved_quality="$(playlist_get "$name" 'flags.quality')"
+  saved_m3u="$(playlist_get "$name" 'flags.m3u')"
+  saved_lyrics="$(playlist_get "$name" 'flags.lyrics')"
+  saved_mpcu="$(playlist_get "$name" 'flags.mpcu')"
+
+  # Runtime flags take precedence over saved flags when explicitly provided
+  [[ "$FLAG_QUALITY" != "$DEFAULT_QUALITY" ]] || FLAG_QUALITY="$saved_quality"
+  [[ "$FLAG_M3U" == "true" ]] || FLAG_M3U="$saved_m3u"
+  [[ "$FLAG_LYRICS" == "true" ]] || FLAG_LYRICS="$saved_lyrics"
+  [[ "$FLAG_MPCU" == "true" ]] || FLAG_MPCU="$saved_mpcu"
+
+  mkdir -p "$path"
+
+  echo
+  echo -e "${BOLD}${BLUE}:: Syncing:${RESET} ${BOLD}${name}${RESET}"
+  echo -e "   ${DIM}URL:${RESET}      $url"
+  echo -e "   ${DIM}Path:${RESET}     $(display_path "$path")"
+  echo -e "   ${DIM}Quality:${RESET}  ${FLAG_QUALITY} kbps"
+  [[ "$FLAG_LYRICS" == "true" ]] && echo -e "   ${DIM}Lyrics:${RESET}   enabled"
+  [[ "$FLAG_M3U" == "true" ]] && echo -e "   ${DIM}M3U:${RESET}      will be generated"
+  separator
+  echo
+
+  local exit_code=0
+  set +e
+  run_ytdlp "$url" "$path" "$archive" "$FLAG_QUALITY" "$FLAG_M3U" "$FLAG_LYRICS" "$FLAG_NERD"
+  exit_code=$?
+  set -e
+
+  print_summary "$name"
+
+  # Generate M3U if requested
+  [[ "$FLAG_M3U" == "true" ]] && generate_m3u "$name" "$path"
+
+  # Update MPD library if mpc is available and flag is set
+  if [[ "$FLAG_MPCU" == "true" ]]; then
+    if command -v mpc &>/dev/null; then
+      info "Running mpc update..."
+      mpc update --quiet && success "MPD library updated."
+    else
+      warn "mpc not found in PATH, skipping library update."
+    fi
+  fi
+
+  # Determine overall status
+  local status="success"
+  [[ "${SYNC_ERRORS}" -gt 0 || "$exit_code" -ne 0 ]] && status="partial"
+
+  # Append to sync history log
+  echo "$(now) | ${name} | downloaded=${SYNC_DOWNLOADED} skipped=${SYNC_SKIPPED} errors=${SYNC_ERRORS} | ${status}" \
+    >>"$HISTORY_FILE"
+
+  if [[ "$status" == "success" ]]; then
+    success "Sync complete."
+  else
+    warn "Sync completed with issues (exit code: ${exit_code})."
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command: download
+# One-shot download — no sync config created or updated.
+# Accepts either a URL or a registered playlist name.
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_download() {
+  parse_flags "$@"
+  set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+  local target="${1:-}" path="${2:-}"
+
+  [[ -z "$target" ]] &&
+    die "URL or playlist name is required.\n  Usage: ${SCRIPT_NAME} download <url|name> [path] [flags]"
+
+  # If the target looks like a registered playlist name, resolve its URL
+  local url
+  if playlist_exists "$target"; then
+    info "Resolving registered playlist '${target}'..."
+    url="$(playlist_get "$target" url)"
+  elif [[ "$target" =~ ^https?:// ]]; then
+    url="$target"
+  else
+    die "Not a valid URL or a known playlist name: '${target}'"
+  fi
+
+  # Default to current directory when no path was given
+  if [[ -z "$path" ]]; then
+    path="$(pwd)"
+  else
+    path="$(expand_path "$path")"
+  fi
+
+  mkdir -p "$path"
+
+  echo
+  echo -e "${BOLD}${BLUE}:: Downloading:${RESET} ${url}"
+  echo -e "   ${DIM}Path:${RESET}     $(display_path "$path")"
+  echo -e "   ${DIM}Quality:${RESET}  ${FLAG_QUALITY} kbps"
+  [[ "$FLAG_LYRICS" == "true" ]] && echo -e "   ${DIM}Lyrics:${RESET}   enabled"
+  [[ "$FLAG_M3U" == "true" ]] && echo -e "   ${DIM}M3U:${RESET}      will be generated"
+  separator
+  echo
+
+  # No archive for one-shot downloads — always re-download if run again
+  set +e
+  run_ytdlp "$url" "$path" "" "$FLAG_QUALITY" "$FLAG_M3U" "$FLAG_LYRICS" "$FLAG_NERD"
+  local exit_code=$?
+  set -e
+
+  print_summary "download"
+
+  # Generate M3U from the output directory if requested
+  if [[ "$FLAG_M3U" == "true" ]]; then
+    local m3u_name
+    m3u_name="$(basename "$path")"
+    generate_m3u "$m3u_name" "$path"
+  fi
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    success "Download complete."
+  else
+    warn "Download completed with issues (exit code: ${exit_code})."
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command: sync-list
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_sync_list() {
+  local files=("$PLAYLISTS_DIR"/*.json)
+
+  if [[ ! -e "${files[0]}" ]]; then
+    info "No playlists registered. Use '${SCRIPT_NAME} add' to get started."
+    return 0
+  fi
+
+  local count="${#files[@]}"
+  echo
+  echo -e "${BOLD}Registered playlists${RESET} ${DIM}(${count})${RESET}"
+  separator
+
+  for file in "${files[@]}"; do
+    [[ -f "$file" ]] || continue
+
+    local name url path quality m3u lyrics mpcu last_sync
+    name="$(jq -r '.name' "$file")"
+    url="$(jq -r '.url' "$file")"
+    path="$(jq -r '.path' "$file")"
+    quality="$(jq -r '.flags.quality // "192"' "$file")"
+    m3u="$(jq -r '.flags.m3u    // false' "$file")"
+    lyrics="$(jq -r '.flags.lyrics // false' "$file")"
+    mpcu="$(jq -r '.flags.mpcu   // false' "$file")"
+
+    local last_sync_raw
+    last_sync_raw="$(grep " | ${name} |" "$HISTORY_FILE" 2>/dev/null | tail -1 | cut -d'|' -f1 | xargs || true)"
+    last_sync="${last_sync_raw:-never}"
+
+    echo -e "  ${BOLD}${GREEN}${name}${RESET}"
+    echo -e "    ${DIM}Path:${RESET}       $(display_path "$path")"
+    echo -e "    ${DIM}URL:${RESET}        ${url}"
+    echo -e "    ${DIM}Quality:${RESET}    ${quality} kbps"
+    echo -e "    ${DIM}Flags:${RESET}      m3u=${m3u}  lyrics=${lyrics}  mpcu=${mpcu}"
+    echo -e "    ${DIM}Last sync:${RESET}  ${last_sync}"
+    echo
+  done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command: sync-history
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_sync_history() {
+  local count="${1:-$DEFAULT_HISTORY_COUNT}"
+  [[ "$count" =~ ^[0-9]+$ ]] || die "N must be a positive integer, got: '${count}'"
+
+  if [[ ! -s "$HISTORY_FILE" ]]; then
+    info "No sync history yet. Run '${SCRIPT_NAME} sync <name>' to start."
+    return 0
+  fi
+
+  echo
+  echo -e "${BOLD}Sync history${RESET} ${DIM}(last ${count} entries, newest first)${RESET}"
+  separator
+
+  local entries
+  mapfile -t entries < <(tail -n "$count" "$HISTORY_FILE" | tac)
+
+  for entry in "${entries[@]}"; do
+    [[ -z "$entry" ]] && continue
+
+    local ts pl stats status
+    IFS='|' read -r ts pl stats status <<<"$entry"
+    ts="$(echo "$ts" | xargs)"
+    pl="$(echo "$pl" | xargs)"
+    stats="$(echo "$stats" | xargs)"
+    status="$(echo "$status" | xargs)"
+
+    local color
+    [[ "$status" == "success" ]] && color="$GREEN" || color="$YELLOW"
+
+    echo -e "  ${DIM}${ts}${RESET}  ${CYAN}${pl}${RESET}"
+    echo -e "    ${DIM}${stats}${RESET}  $(echo -e "${color}[${status}]${RESET}")"
+    echo
+  done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+main() {
+  require yt-dlp jq ffmpeg
+  init_dirs
+
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift
+
+  case "$cmd" in
+  add) cmd_add "$@" ;;
+  update) cmd_update "$@" ;;
+  remove) cmd_remove "$@" ;;
+  sync) cmd_sync "$@" ;;
+  download) cmd_download "$@" ;;
+  sync-list) cmd_sync_list ;;
+  sync-history) cmd_sync_history "$@" ;;
+  -h | --help | help) show_help ;;
+  -v | --version) echo "${SCRIPT_NAME} v${VERSION}" ;;
+  "") show_help ;;
+  *)
+    die "Unknown command: '${cmd}'. Run '${SCRIPT_NAME} --help' for usage."
+    ;;
+  esac
+}
+
+main "$@"
