@@ -1,6 +1,6 @@
 # yuti
 
-A minimal, yt-dlp-powered CLI for managing offline YouTube Music playlists — inspired by `spotdl sync`.
+A minimal, yt-dlp-powered CLI for managing offline YouTube Music playlists — inspired by [spotdl](https://github.com/spotDL/spotify-downloader).
 
 Register playlists once with all your preferred flags, run `yuti sync` whenever you want updates, and only new tracks get downloaded. Everything is stored as plain text files in `~/.config/yuti/`, compatible with Syncthing, rsync, or any backup tool.
 
@@ -224,11 +224,11 @@ When `--m3u` is active, yuti scans the output directory after sync and writes a 
 
 ---
 
-## Offline Sync with Syncthing
+## Offline Sync with [Syncthing](https://github.com/syncthing/syncthing) (since I do it).
 
 All music and config files are plain files on disk, so any file sync tool works:
 
-1. Set your playlist path to a folder managed by Syncthing (e.g. `~/Sync/Music/lofi`)
+1. Set your playlist path to a folder managed by Syncthing (e.g. `~/Music/lofi`)
 2. Run `yuti sync lofi` on your main machine
 3. New tracks appear on all other synced devices automatically
 
@@ -239,4 +239,3 @@ The `archives/` directory should also be synced if you want to avoid re-download
 ## License
 
 MIT
->>>>>>> f62e602 (Initial commit)
